@@ -74,22 +74,85 @@ var ActivityHandler = {
     }
   },
 
-  _onNewActivity: function newHandler(activity) {
-    // This lock is for avoiding several calls at the same time.
-    if (this.isLocked) {
-      return;
+  _isMessageBelongTo1to1Conversation:
+  function isMessageBelongTo1to1Conversation(number, message) {
+    var isIncoming = message.delivery === 'received' ||
+                     message.delivery === 'not-downloaded';
+    var isOutgoing = !isIncoming;
+    // if it is a received message, it is a candidate
+    // we still need to test the sender in case the user filters with his own
+    // number, because we would get all the received messages in this case.
+    var matchingReceivedMessage = isIncoming &&
+      Utils.probablyMatches(message.sender, number);
+    if (matchingReceivedMessage) {
+      return true;
+    }
+    // in case of sent messages and sms, we test if the receiver match the
+    // filter, to filter out other sent messages in the case user is sending
+    // message to himself
+    if (isOutgoing) {
+      if (message.type === 'sms' &&
+          Utils.probablyMatches(message.receiver, number)) {
+        return true;
+      }
+      // For MMS, we are only interested in 1-to-1 messages.
+      return message.type === 'mms' && message.receivers.length === 1 &&
+              Utils.probablyMatches(message.receivers[0], number);
+    }
+    return false;
+  },
+
+  /**
+   * _findThreadFromNumber
+   *
+   * Find a SMS/MMS thread from a number.
+   * @return Promise that resolve to a threadId or rejected if not found
+   */
+  _findThreadFromNumber: function findThread(number) {
+
+    function checkCandidate(message) {
+      var isMessageInThread = ActivityHandler.
+        _isMessageBelongTo1to1Conversation(number, message);
+      if (isMessageInThread) {
+        threadId = message.threadId || null;
+        return false; // found the message, stop iterating
+      }
     }
 
-    this.isLocked = true;
+    var threadId = null;
+    var deferred = Utils.Promise.defer();
 
-    var number = activity.source.data.number;
-    var body = activity.source.data.body;
+    MessageManager.getMessages({
+      filter: { numbers: [number] },
+      each: checkCandidate,
+      done: function() {
+        if (threadId == null) {
+          deferred.reject('No thread found for number: ' + number);
+        } else {
+          deferred.resolve(threadId);
+        }
+      }
+    });
 
-    Contacts.findByPhoneNumber(number, function findContact(results) {
+    return deferred.promise;
+  },
+
+  /**
+  * Finds a contact from a number.
+  * Returns a promise that resolve with a contact
+  * or is rejected if not found
+  * @returns Promise that resolve to a
+  * {number: String, name: String, source: 'contacts'}
+  */
+  _findContactByNumber: function findContactByNumber(number) {
+    // if we have a threadId, we don't need to look for a contact.
+    var deferred = Utils.Promise.defer();
+    Contacts.findByPhoneNumber(number, function(results) {
       var record, name, contact;
 
       // Bug 867948: results null is a legitimate case
       if (results && results.length) {
+        console.log(results[0]);
         record = results[0];
         name = record.name.length && record.name[0];
         contact = {
@@ -97,14 +160,47 @@ var ActivityHandler = {
           name: name,
           source: 'contacts'
         };
-      }
 
-      ActivityHandler.toView({
-        body: body,
-        number: number,
-        contact: contact || null
-      });
+        deferred.resolve(contact);
+      }
+      deferred.reject('No contact found with number: ' + number);
+
     });
+
+    return deferred.promise;
+  },
+
+  _onNewActivity: function newHandler(activity) {
+
+    // This lock is for avoiding several calls at the same time.
+    if (this.isLocked) {
+      return;
+    }
+
+    this.isLocked = true;
+
+    var viewInfo = {
+      body: activity.source.data.body,
+      number: activity.source.data.number,
+      contact: null,
+      threadId: null
+    };
+    // is there already a thread for this contact?
+    this._findThreadFromNumber(viewInfo.number)
+      .then(function(threadId) {
+        viewInfo.threadId = threadId;
+        ActivityHandler.toView(viewInfo);
+      })
+      .catch(function() {
+        ActivityHandler._findContactByNumber(viewInfo.number)
+          .then(function(contact) {
+            viewInfo.contact = contact;
+            ActivityHandler.toView(viewInfo);
+          })
+          .catch(function() {
+            ActivityHandler.toView(viewInfo);
+          });
+      });
   },
 
   _onShareActivity: function shareHandler(activity) {
